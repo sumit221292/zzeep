@@ -7,23 +7,57 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ["http://localhost:3000", "https://guileless-fairy-364399.netlify.app/"],
+    origin: ["http://localhost:3000", "https://guileless-fairy-364399.netlify.app"],
     methods: ["GET", "POST"]
   }
 });
 
-const redis = new Redis();
+// Redis connection with fallback
+let redis;
+try {
+  redis = new Redis('redis://default:qX5BFuzpRoRYJf3IROuhTP0urApm0OSN@redis-12982.c14.us-east-1-2.ec2.redns.redis-cloud.com:12982', {
+    retryDelayOnFailover: 100,
+    maxRetriesPerRequest: 3,
+    lazyConnect: true,
+    tls: {} // Redis Cloud requires TLS
+  });
+  
+  redis.on('error', (err) => {
+    console.log('Redis connection error:', err.message);
+  });
+  
+  redis.on('connect', () => {
+    console.log('Connected to Redis');
+  });
+} catch (error) {
+  console.log('Redis initialization failed:', error.message);
+  redis = null;
+}
 
 // Track active sessions
 const activeSessions = new Map(); // userId -> socketId
+const userPresenceCache = new Map(); // Fallback when Redis is unavailable
 
 // Store user presence and call status data
 const updateUserPresence = async (userId, status) => {
-  await redis.hset('user_presence', userId, status);
-  // Broadcast to all EXCEPT the user who changed status
-  const senderSocketId = activeSessions.get(userId);
-  if (senderSocketId) {
-    io.to(senderSocketId).broadcast.emit('presence_update', { userId, status });
+  try {
+    if (redis && redis.status === 'ready') {
+      await redis.hset('user_presence', userId, status);
+    } else {
+      // Fallback to in-memory storage
+      userPresenceCache.set(userId, status);
+      console.log(`Stored user presence in memory: ${userId} - ${status}`);
+    }
+    
+    // Broadcast to all EXCEPT the user who changed status
+    const senderSocketId = activeSessions.get(userId);
+    if (senderSocketId) {
+      io.to(senderSocketId).broadcast.emit('presence_update', { userId, status });
+    }
+  } catch (error) {
+    console.log('Error updating user presence:', error.message);
+    // Fallback to in-memory storage
+    userPresenceCache.set(userId, status);
   }
 };
 
@@ -127,6 +161,9 @@ io.on('connection', (socket) => {
   });
 });
 
-server.listen(4000, () => {
-  console.log('Server running on port 4000');
+// Use PORT environment variable for Render
+const PORT = process.env.PORT || 4000;
+
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
