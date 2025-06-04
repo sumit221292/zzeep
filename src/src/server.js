@@ -1,7 +1,7 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const Redis = require('ioredis');
+const { createClient } = require('redis');
 
 const app = express();
 const server = http.createServer(app);
@@ -12,57 +12,43 @@ const io = new Server(server, {
   }
 });
 
-// Redis connection with fallback
-let redis;
-try {
-  redis = new Redis('redis://default:qX5BFuzpRoRYJf3IROuhTP0urApm0OSN@redis-12982.c14.us-east-1-2.ec2.redns.redis-cloud.com:12982', {
-    retryDelayOnFailover: 100,
-    maxRetriesPerRequest: 3,
-    lazyConnect: true,
-    tls: {} // Redis Cloud requires TLS
-  });
-  
-  redis.on('error', (err) => {
-    console.log('Redis connection error:', err.message);
-  });
-  
-  redis.on('connect', () => {
-    console.log('Connected to Redis');
-  });
-} catch (error) {
-  console.log('Redis initialization failed:', error.message);
-  redis = null;
-}
+// Redis Cloud Configuration
+const redisClient = createClient({
+  username: 'default',
+  password: 'qX5BFuzpRoRYJf3IROuhTP0urApm0OSN',
+  socket: {
+    host: 'redis-12982.c14.us-east-1-2.ec2.redns.redis-cloud.com',
+    port: 12982
+  }
+});
 
-// Track active sessions
-const activeSessions = new Map(); // userId -> socketId
-const userPresenceCache = new Map(); // Fallback when Redis is unavailable
+redisClient.on('error', err => console.log('Redis Client Error', err));
 
-// Store user presence and call status data
+// Initialize Redis connection
+const initRedis = async () => {
+  await redisClient.connect();
+  console.log('Redis connected successfully');
+};
+
+initRedis().catch(console.error);
+
+// Update user presence using Redis
 const updateUserPresence = async (userId, status) => {
   try {
-    if (redis && redis.status === 'ready') {
-      await redis.hset('user_presence', userId, status);
-    } else {
-      // Fallback to in-memory storage
-      userPresenceCache.set(userId, status);
-      console.log(`Stored user presence in memory: ${userId} - ${status}`);
-    }
-    
+    await redisClient.set(`user:${userId}:status`, status);
     // Broadcast to all EXCEPT the user who changed status
     const senderSocketId = activeSessions.get(userId);
     if (senderSocketId) {
       io.to(senderSocketId).broadcast.emit('presence_update', { userId, status });
     }
   } catch (error) {
-    console.log('Error updating user presence:', error.message);
-    // Fallback to in-memory storage
-    userPresenceCache.set(userId, status);
+    console.error('Redis update error:', error);
   }
 };
 
-// Store active calls
-const activeUsers = new Map();
+// Track active sessions
+const activeSessions = new Map(); // userId -> socketId
+const activeUsers = new Map(); // Store active calls
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -161,9 +147,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// Use PORT environment variable for Render
 const PORT = process.env.PORT || 4000;
-
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server is running on port ${PORT}`);
 });
