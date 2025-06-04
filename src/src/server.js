@@ -12,30 +12,69 @@ const io = new Server(server, {
   }
 });
 
-// Redis Cloud Configuration
-const redisClient = createClient({
-  username: 'default',
-  password: 'qX5BFuzpRoRYJf3IROuhTP0urApm0OSN',
-  socket: {
-    host: 'redis-12982.c14.us-east-1-2.ec2.redns.redis-cloud.com',
-    port: 12982
-  }
+// Redis Configuration - Fixed for production
+let redisClient;
+
+if (process.env.NODE_ENV === 'production' || process.env.REDIS_URL) {
+  // Production Redis Cloud Configuration
+  redisClient = createClient({
+    username: 'default',
+    password: 'qX5BFuzpRoRYJf3IROuhTP0urApm0OSN',
+    socket: {
+      host: 'redis-12982.c14.us-east-1-2.ec2.redns.redis-cloud.com',
+      port: 12982,
+      tls: false, // Set to true if your Redis Cloud requires TLS
+      connectTimeout: 60000,
+      lazyConnect: true
+    }
+  });
+} else {
+  // Local development Redis
+  redisClient = createClient({
+    socket: {
+      host: 'localhost',
+      port: 6379
+    }
+  });
+}
+
+// Enhanced error handling
+redisClient.on('error', (err) => {
+  console.error('Redis Client Error:', err);
 });
 
-redisClient.on('error', err => console.log('Redis Client Error', err));
+redisClient.on('connect', () => {
+  console.log('Redis client connected');
+});
 
-// Initialize Redis connection
+redisClient.on('ready', () => {
+  console.log('Redis client ready');
+});
+
+redisClient.on('end', () => {
+  console.log('Redis connection ended');
+});
+
+// Initialize Redis connection with better error handling
 const initRedis = async () => {
-  await redisClient.connect();
-  console.log('Redis connected successfully');
+  try {
+    if (!redisClient.isOpen) {
+      await redisClient.connect();
+      console.log('Redis connected successfully');
+    }
+  } catch (error) {
+    console.error('Failed to connect to Redis:', error);
+    // Continue without Redis for basic functionality
+    console.log('Continuing without Redis - some features may be limited');
+  }
 };
 
-initRedis().catch(console.error);
-
-// Update user presence using Redis
+// Update user presence using Redis with fallback
 const updateUserPresence = async (userId, status) => {
   try {
-    await redisClient.set(`user:${userId}:status`, status);
+    if (redisClient.isOpen) {
+      await redisClient.set(`user:${userId}:status`, status);
+    }
     // Broadcast to all EXCEPT the user who changed status
     const senderSocketId = activeSessions.get(userId);
     if (senderSocketId) {
@@ -43,6 +82,11 @@ const updateUserPresence = async (userId, status) => {
     }
   } catch (error) {
     console.error('Redis update error:', error);
+    // Continue with socket broadcast even if Redis fails
+    const senderSocketId = activeSessions.get(userId);
+    if (senderSocketId) {
+      io.to(senderSocketId).broadcast.emit('presence_update', { userId, status });
+    }
   }
 };
 
@@ -147,7 +191,29 @@ io.on('connection', (socket) => {
   });
 });
 
-const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+// Initialize Redis before starting server
+initRedis().then(() => {
+  const PORT = process.env.PORT || 4000;
+  server.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+  });
+}).catch((error) => {
+  console.error('Failed to initialize Redis, starting server anyway:', error);
+  const PORT = process.env.PORT || 4000;
+  server.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT} (without Redis)`);
+  });
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('Shutting down gracefully...');
+  try {
+    if (redisClient.isOpen) {
+      await redisClient.quit();
+    }
+  } catch (error) {
+    console.error('Error closing Redis connection:', error);
+  }
+  process.exit(0);
 });
